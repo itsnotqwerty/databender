@@ -42,6 +42,13 @@ impl MediaFormat {
         }
     }
 
+    pub fn from_path_extension(path: impl AsRef<Path>) -> Option<Self> {
+        path.as_ref()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .and_then(|extension| extension.parse().ok())
+    }
+
     pub fn detect(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::open(path).map_err(|source| DatabenderError::Io {
@@ -153,5 +160,20 @@ mod tests {
         assert_eq!(MediaFormat::detect_bytes(b"not media"), None);
         assert_eq!(MediaFormat::detect_bytes(b"RIFF"), None);
         assert_eq!(MediaFormat::detect_bytes(b"\x00\x00\x00\x18fty"), None);
+    }
+
+    #[test]
+    fn recognizes_supported_path_extensions_and_aliases() {
+        for (path, expected) in [
+            ("image.JPG", MediaFormat::Jpeg),
+            ("image.png", MediaFormat::Png),
+            ("audio.wave", MediaFormat::Wav),
+            ("audio.opus", MediaFormat::Ogg),
+            ("video.MATROSKA", MediaFormat::Matroska),
+        ] {
+            assert_eq!(MediaFormat::from_path_extension(path), Some(expected));
+        }
+        assert_eq!(MediaFormat::from_path_extension("notes.txt"), None);
+        assert_eq!(MediaFormat::from_path_extension("extensionless"), None);
     }
 }

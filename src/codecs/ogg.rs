@@ -1,13 +1,14 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, fs, path::PathBuf};
 
 use crate::{
-    codecs::mp4::process_audio_stages,
-    ffmpeg::{AudioProperties, AudioStreamInfo, BasicMetadata, ToolRunner},
-    DatabenderError, MediaFormat, PreparedTransform, Result,
+    codecs::{mp4::process_audio_stages, ogg_pages},
+    ffmpeg::{AudioProperties, AudioStreamInfo, BasicMetadata, ToolOutput, ToolRunner},
+    filters::FilterDomain,
+    DatabenderError, FilterSpec, MediaFormat, PreparedTransform, Result,
 };
 
 pub fn execute(prepared: PreparedTransform) -> Result<PathBuf> {
-    let runner = ToolRunner::default();
+    let runner = ToolRunner::default().with_cancellation(prepared.cancellation().clone());
     let streams = runner.probe_audio_streams(prepared.input())?;
     if streams.is_empty() {
         return Err(invalid_ogg("input contains no audio streams"));
@@ -21,29 +22,78 @@ pub fn execute(prepared: PreparedTransform) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     let expected_metadata = runner.probe_basic_metadata(prepared.input())?;
     let input = prepared.input().to_path_buf();
-    let workspace = tempfile::tempdir().map_err(|source| DatabenderError::Io {
-        path: prepared.output().to_path_buf(),
-        source,
-    })?;
-    let processed = streams
+    let max_decode_errors = prepared
+        .plan()
+        .stages
         .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            process_audio_stages(
-                &runner,
-                &input,
-                index,
-                &prepared.plan().stages,
-                workspace.path(),
-            )
+        .flat_map(|stage| &stage.filters)
+        .filter_map(|filter| match filter {
+            FilterSpec::OggPacketNoise {
+                max_decode_errors, ..
+            } => Some(*max_decode_errors),
+            _ => None,
         })
-        .collect::<Result<Vec<_>>>()?;
+        .min()
+        .unwrap_or(0);
+    let stages = prepared.plan().stages.clone();
     let encoder = runner.clone();
     let expected_streams = streams.clone();
+    let cancellation = prepared.cancellation().clone();
 
     prepared.publish_path_with(
         move |candidate| {
-            encoder.ffmpeg(encode_arguments(&input, candidate, &processed, &streams)?)?;
+            let workspace = tempfile::tempdir().map_err(|source| DatabenderError::Io {
+                path: candidate.to_path_buf(),
+                source,
+            })?;
+            let mut current = input.clone();
+            for (stage_index, stage) in stages.iter().enumerate() {
+                cancellation.check()?;
+                let output = workspace.path().join(format!("stage-{stage_index}.ogg"));
+                match stage.domain {
+                    FilterDomain::OggPacket => {
+                        let mut encoded = read(&current)?;
+                        for (filter_index, filter) in stage.filters.iter().enumerate() {
+                            cancellation.check()?;
+                            apply_packet_filter(
+                                filter,
+                                &mut encoded,
+                                stage.seed.wrapping_add(filter_index as u64),
+                            )?;
+                        }
+                        write(&output, &encoded)?;
+                    }
+                    FilterDomain::PcmAudio | FilterDomain::FfmpegAudio => {
+                        let current_streams = encoder.probe_audio_streams(&current)?;
+                        let processed = current_streams
+                            .iter()
+                            .enumerate()
+                            .map(|(index, _)| {
+                                process_audio_stages(
+                                    &encoder,
+                                    &current,
+                                    index,
+                                    stage.seed,
+                                    std::slice::from_ref(stage),
+                                    workspace.path(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        encoder.ffmpeg(encode_arguments(
+                            &current,
+                            &output,
+                            &processed,
+                            &current_streams,
+                        )?)?;
+                    }
+                    _ => unreachable!("Ogg plans contain only packet and audio stages"),
+                }
+                current = output;
+            }
+            fs::copy(&current, candidate).map_err(|source| DatabenderError::Io {
+                path: candidate.to_path_buf(),
+                source,
+            })?;
             drop(workspace);
             Ok(())
         },
@@ -54,9 +104,49 @@ pub fn execute(prepared: PreparedTransform) -> Result<PathBuf> {
                 &expected_streams,
                 &expected_properties,
                 &expected_metadata,
+                max_decode_errors,
             )
         },
     )
+}
+
+fn apply_packet_filter(filter: &FilterSpec, encoded: &mut [u8], seed: u64) -> Result<()> {
+    let FilterSpec::OggPacketNoise {
+        byte_budget,
+        start_packet,
+        packet_count,
+        intensity,
+        ..
+    } = filter
+    else {
+        return Err(invalid_ogg(format!(
+            "filter {} is not an Ogg packet filter",
+            filter.name()
+        )));
+    };
+    ogg_pages::mutate(
+        encoded,
+        *byte_budget,
+        *start_packet,
+        *packet_count,
+        *intensity,
+        seed,
+    )?;
+    Ok(())
+}
+
+fn read(path: &std::path::Path) -> Result<Vec<u8>> {
+    fs::read(path).map_err(|source| DatabenderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn write(path: &std::path::Path, encoded: &[u8]) -> Result<()> {
+    fs::write(path, encoded).map_err(|source| DatabenderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn encode_arguments(
@@ -111,10 +201,12 @@ fn validate(
     expected_streams: &[AudioStreamInfo],
     expected_properties: &[AudioProperties],
     expected_metadata: &BasicMetadata,
+    max_decode_errors: usize,
 ) -> Result<()> {
     if MediaFormat::detect(candidate)? != MediaFormat::Ogg {
         return Err(invalid_ogg("candidate container changed"));
     }
+    ogg_pages::parse(&read(candidate)?)?;
     let streams = runner.validate_audio_streams(candidate, expected_properties)?;
     for (actual, expected) in streams.iter().zip(expected_streams) {
         if actual.codec_name != expected.codec_name {
@@ -127,7 +219,7 @@ fn validate(
     if runner.probe_basic_metadata(candidate)? != *expected_metadata {
         return Err(invalid_ogg("basic metadata changed during transformation"));
     }
-    runner.ffmpeg([
+    let decode = runner.ffmpeg([
         OsString::from("-v"),
         OsString::from("error"),
         OsString::from("-i"),
@@ -138,11 +230,58 @@ fn validate(
         OsString::from("null"),
         OsString::from("-"),
     ])?;
+    enforce_damage_limit(&decode, max_decode_errors)
+}
+
+fn enforce_damage_limit(output: &ToolOutput, max_decode_errors: usize) -> Result<()> {
+    if output.stderr.truncated {
+        return Err(invalid_ogg(
+            "decoder diagnostics were truncated, so the damage limit cannot be verified",
+        ));
+    }
+    let decode_errors = output
+        .stderr
+        .bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| line.iter().any(|byte| !byte.is_ascii_whitespace()))
+        .count();
+    if decode_errors > max_decode_errors {
+        return Err(invalid_ogg(format!(
+            "decoder reported {decode_errors} error lines, exceeding the configured limit of {max_decode_errors}"
+        )));
+    }
     Ok(())
 }
 
 fn invalid_ogg(reason: impl Into<String>) -> DatabenderError {
     DatabenderError::OutputValidation {
         reason: format!("invalid Ogg: {}", reason.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ffmpeg::CapturedOutput;
+
+    fn output(stderr: &[u8], truncated: bool) -> ToolOutput {
+        ToolOutput {
+            stdout: CapturedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            stderr: CapturedOutput {
+                bytes: stderr.to_vec(),
+                truncated,
+            },
+        }
+    }
+
+    #[test]
+    fn enforces_configured_decoder_error_lines() {
+        assert!(enforce_damage_limit(&output(b"", false), 0).is_ok());
+        assert!(enforce_damage_limit(&output(b"first\nsecond\n", false), 2).is_ok());
+        assert!(enforce_damage_limit(&output(b"first\nsecond\n", false), 1).is_err());
+        assert!(enforce_damage_limit(&output(b"first\n", true), 10).is_err());
     }
 }

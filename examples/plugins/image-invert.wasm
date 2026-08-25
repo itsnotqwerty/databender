@@ -1,0 +1,8 @@
+(module
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\22event\22:\22completed\22,\22invocation_id\22:1,\22output\22:{\22domain\22:\22image-frame\22,\22width\22:1,\22height\22:1,\22stride\22:4,\22pixel_format\22:\22rgba8\22,\22data\22:[245,235,225,255]}}")
+  (func (export "databender_alloc") (param i32) (result i32)
+    i32.const 4096)
+  (func (export "databender_run") (param i32 i32) (result i64)
+    i64.const 153)
+)

@@ -14,6 +14,7 @@ pub fn execute(prepared: PreparedTransform) -> Result<std::path::PathBuf> {
     let original = encoded.clone();
 
     for stage in &prepared.plan().stages {
+        prepared.cancellation().check()?;
         match stage.domain {
             FilterDomain::EncodedPayload => bytes::apply(
                 &stage.filters,

@@ -14,6 +14,7 @@ pub fn compile_audio_graph(filters: &[FilterSpec]) -> Result<String> {
                 Ok(format!("aecho=0.8:0.9:{delay_ms}:{decay}"))
             }
             FilterSpec::AudioEffect(AudioEffect::Volume { gain }) => Ok(format!("volume={gain}")),
+            FilterSpec::ExpertAudioGraph(graph) => Ok(graph.fragment().to_owned()),
             _ => Err(DatabenderError::OutputValidation {
                 reason: format!(
                     "filter {} cannot be compiled into an FFmpeg audio graph",

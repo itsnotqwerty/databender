@@ -1,0 +1,1 @@
+{"manifest_version":1,"abi_version":1,"id":"example.fuzz","name":"Fuzz","version":"1.0.0","filters":[{"id":"invert","name":"Invert","description":"Fixture","domains":["image-frame"],"deterministic":true,"parameters":[]}]}

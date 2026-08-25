@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "abi_version": 1,
+  "id": "org.databender.example.image-invert",
+  "name": "Image Invert Example",
+  "version": "1.0.0",
+  "filters": [
+    {
+      "id": "invert",
+      "name": "Invert",
+      "description": "Returns the conformance fixture with inverted RGB channels",
+      "domains": ["image-frame"],
+      "deterministic": true,
+      "parameters": []
+    }
+  ]
+}

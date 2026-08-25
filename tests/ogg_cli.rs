@@ -1,7 +1,7 @@
-use std::process::Command as ProcessCommand;
+use std::{fs, process::Command as ProcessCommand};
 
 use assert_cmd::Command;
-use databender::{ffmpeg::ToolRunner, MediaFormat};
+use databender::{codecs::ogg_pages, ffmpeg::ToolRunner, MediaFormat};
 use predicates::prelude::*;
 
 fn ffmpeg_available() -> bool {
@@ -90,6 +90,138 @@ fn transforms_ogg_vorbis() {
 #[test]
 fn transforms_ogg_opus() {
     transform_codec("opus");
+}
+
+fn mutate_codec(codec: &str) {
+    if !ffmpeg_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join(format!("input-{codec}.ogg"));
+    let first = directory.path().join(format!("first-{codec}.ogg"));
+    let second = directory.path().join(format!("second-{codec}.ogg"));
+    write_ogg(&input, codec);
+    let filter = "ogg-packet-noise:byte_budget=1,start_packet=1,packet_count=2,intensity=0.125";
+
+    for output in [&first, &second] {
+        Command::cargo_bin("databender")
+            .unwrap()
+            .args([
+                "transform",
+                input.to_str().unwrap(),
+                "--output",
+                output.to_str().unwrap(),
+                "--seed",
+                "42",
+                "--filter",
+                filter,
+            ])
+            .assert()
+            .success();
+    }
+
+    assert_ne!(fs::read(&input).unwrap(), fs::read(&first).unwrap());
+    assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+    ogg_pages::parse(&fs::read(&first).unwrap()).unwrap();
+    let runner = ToolRunner::default();
+    let expected = runner.probe_audio(&input).unwrap();
+    let actual = runner.validate_audio(&first, expected.properties).unwrap();
+    assert_eq!(actual.codec_name, codec);
+}
+
+#[test]
+fn mutates_vorbis_packets_deterministically_and_fully_decodes() {
+    mutate_codec("vorbis");
+}
+
+#[test]
+fn mutates_opus_packets_deterministically_and_fully_decodes() {
+    mutate_codec("opus");
+}
+
+#[test]
+fn preserves_order_between_packet_and_ffmpeg_ogg_stages() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.ogg");
+    let output = directory.path().join("output.ogg");
+    write_ogg(&input, "opus");
+
+    Command::cargo_bin("databender")
+        .unwrap()
+        .args([
+            "transform",
+            input.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--seed",
+            "42",
+            "--filter",
+            "ogg-packet-noise:byte_budget=1,start_packet=1,packet_count=2,intensity=0.125",
+            "--filter",
+            "volume:gain=0.9",
+        ])
+        .assert()
+        .success();
+
+    ogg_pages::parse(&fs::read(&output).unwrap()).unwrap();
+    let runner = ToolRunner::default();
+    let expected = runner.probe_audio(&input).unwrap();
+    assert_eq!(
+        runner
+            .validate_audio(&output, expected.properties)
+            .unwrap()
+            .codec_name,
+        "opus"
+    );
+}
+
+#[test]
+fn reports_ogg_packet_mutation_impact() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("input.ogg");
+    let output_directory = directory.path().join("output");
+    write_ogg(&input, "opus");
+    let filter = "ogg-packet-noise:byte_budget=12,start_packet=3,packet_count=4,intensity=0.25,max_decode_errors=2";
+    let estimate = "up to 12 payload bytes in audio packets 3 through 6, flipping up to 2 bits per byte; tolerate 2 decoder error lines";
+
+    Command::cargo_bin("databender")
+        .unwrap()
+        .args([
+            "plan", "--format", "ogg", "--seed", "42", "--filter", filter,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "impact estimate: {estimate}"
+        )));
+
+    let output = Command::cargo_bin("databender")
+        .unwrap()
+        .args([
+            "batch",
+            input.to_str().unwrap(),
+            "--output-dir",
+            output_directory.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+            "--seed",
+            "42",
+            "--filter",
+            filter,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mutation_impacts"][0]["filter"], "ogg-packet-noise");
+    assert_eq!(report["mutation_impacts"][0]["estimate"], estimate);
+    assert!(!output_directory.exists());
 }
 
 #[test]

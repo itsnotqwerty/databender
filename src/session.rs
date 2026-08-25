@@ -6,7 +6,7 @@ use std::{
 
 use tempfile::NamedTempFile;
 
-use crate::{DatabenderError, FilterSpec, MediaFormat, PipelinePlan, Result};
+use crate::{CancellationToken, DatabenderError, FilterSpec, MediaFormat, PipelinePlan, Result};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransformRequest {
@@ -15,6 +15,8 @@ pub struct TransformRequest {
     pub filters: Vec<FilterSpec>,
     pub seed: u64,
     pub force: bool,
+    pub video_streams: Vec<usize>,
+    cancellation: CancellationToken,
 }
 
 impl TransformRequest {
@@ -30,6 +32,8 @@ impl TransformRequest {
             filters,
             seed,
             force: true,
+            video_streams: Vec::new(),
+            cancellation: CancellationToken::default(),
         }
     }
 
@@ -43,7 +47,18 @@ impl TransformRequest {
         self
     }
 
+    pub fn with_video_streams(mut self, video_streams: Vec<usize>) -> Self {
+        self.video_streams = video_streams;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = cancellation;
+        self
+    }
+
     pub fn prepare(self) -> Result<PreparedTransform> {
+        self.cancellation.check()?;
         let input = canonicalize(&self.input)?;
         let output = normalize_output(&self.output)?;
 
@@ -62,6 +77,8 @@ impl TransformRequest {
             output,
             force: self.force,
             plan,
+            video_streams: self.video_streams,
+            cancellation: self.cancellation,
         })
     }
 }
@@ -72,6 +89,8 @@ pub struct PreparedTransform {
     output: PathBuf,
     force: bool,
     plan: PipelinePlan,
+    video_streams: Vec<usize>,
+    cancellation: CancellationToken,
 }
 
 impl PreparedTransform {
@@ -87,11 +106,20 @@ impl PreparedTransform {
         &self.plan
     }
 
+    pub fn video_streams(&self) -> &[usize] {
+        &self.video_streams
+    }
+
+    pub fn cancellation(&self) -> &CancellationToken {
+        &self.cancellation
+    }
+
     pub fn publish_with<W, V>(self, write_candidate: W, validate_candidate: V) -> Result<PathBuf>
     where
         W: FnOnce(&mut File) -> std::io::Result<()>,
         V: FnOnce(&Path) -> Result<()>,
     {
+        self.cancellation.check()?;
         let parent = self
             .output
             .parent()
@@ -115,6 +143,7 @@ impl PreparedTransform {
                 source,
             })?;
         validate_candidate(candidate.path())?;
+        self.cancellation.check()?;
 
         let persisted = if self.force {
             candidate.persist(&self.output)
@@ -146,6 +175,7 @@ impl PreparedTransform {
         W: FnOnce(&Path) -> Result<()>,
         V: FnOnce(&Path) -> Result<()>,
     {
+        self.cancellation.check()?;
         let parent = self
             .output
             .parent()
@@ -166,6 +196,7 @@ impl PreparedTransform {
                 source,
             })?;
         validate_candidate(candidate.path())?;
+        self.cancellation.check()?;
 
         let persisted = if self.force {
             candidate.persist(&self.output)
@@ -244,6 +275,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read(output).unwrap(), b"validated output");
+    }
+
+    #[test]
+    fn cancellation_discards_candidate_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("cancelled.png");
+        let cancellation = CancellationToken::default();
+        let cancel_during_write = cancellation.clone();
+        let prepared = png_request(directory.path(), "cancelled.png")
+            .with_cancellation(cancellation)
+            .prepare()
+            .unwrap();
+
+        let error = prepared
+            .publish_with(
+                move |candidate| {
+                    candidate.write_all(b"candidate")?;
+                    cancel_during_write.cancel();
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, DatabenderError::Cancelled));
+        assert!(!output.exists());
     }
 
     #[test]

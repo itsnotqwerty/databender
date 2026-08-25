@@ -1,9 +1,12 @@
 use crate::{
-    codecs::capabilities_for,
+    codecs::{capabilities_for, runtime_unavailable_reason},
     error::{DatabenderError, Result},
-    filters::{FilterDomain, FilterSpec},
+    filters::{audio::compile_audio_graph, video::compile_video_graph, FilterDomain, FilterSpec},
     media::{MediaFormat, StreamKind},
+    seed::{derive_seed, SeedIdentity},
 };
+
+pub const PIPELINE_PLAN_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PipelineStage {
@@ -11,13 +14,18 @@ pub struct PipelineStage {
     pub target: StreamKind,
     pub seed: u64,
     pub filters: Vec<FilterSpec>,
+    pub resolved_graph: Option<String>,
+    pub environment_dependent: bool,
+    pub(crate) index: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PipelinePlan {
+    pub version: u32,
     pub format: MediaFormat,
     pub seed: u64,
     pub stages: Vec<PipelineStage>,
+    pub environment_dependent: bool,
 }
 
 impl PipelinePlan {
@@ -30,6 +38,13 @@ impl PipelinePlan {
                     filter: filter.name().to_owned(),
                     format: format.to_string(),
                     reason: format!("the {:?} domain is not supported", filter.domain()),
+                });
+            }
+            if let Some(reason) = runtime_unavailable_reason(format, filter) {
+                return Err(DatabenderError::IncompatibleFilter {
+                    filter: filter.name().to_owned(),
+                    format: format.to_string(),
+                    reason,
                 });
             }
         }
@@ -53,31 +68,38 @@ impl PipelinePlan {
                     .filters
                     .push(filter);
             } else {
-                let stage_seed = derive_seed(seed, stages.len() as u64);
+                let stage_seed = derive_seed(seed, SeedIdentity::Stage(stages.len() as u64));
                 stages.push(PipelineStage {
                     domain,
                     target,
                     seed: stage_seed,
                     filters: vec![filter],
+                    resolved_graph: None,
+                    environment_dependent: false,
+                    index: stages.len() as u64,
                 });
             }
         }
 
+        for stage in &mut stages {
+            stage.environment_dependent =
+                stage.filters.iter().any(FilterSpec::environment_dependent);
+            stage.resolved_graph = match stage.domain {
+                FilterDomain::FfmpegAudio => Some(compile_audio_graph(&stage.filters)?),
+                FilterDomain::FfmpegVideo => Some(compile_video_graph(&stage.filters)?),
+                _ => None,
+            };
+        }
+        let environment_dependent = stages.iter().any(|stage| stage.environment_dependent);
+
         Ok(Self {
+            version: PIPELINE_PLAN_VERSION,
             format,
             seed,
             stages,
+            environment_dependent,
         })
     }
-}
-
-fn derive_seed(seed: u64, stage_index: u64) -> u64 {
-    let mut value = seed
-        .wrapping_add(stage_index)
-        .wrapping_add(0x9e3779b97f4a7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-    value ^ (value >> 31)
 }
 
 #[cfg(test)]
@@ -140,6 +162,24 @@ mod tests {
         let second = PipelinePlan::build(MediaFormat::Png, filters, 123).unwrap();
 
         assert_eq!(first, second);
+        assert_eq!(first.version, PIPELINE_PLAN_VERSION);
         assert_ne!(first.stages[0].seed, first.stages[1].seed);
+    }
+
+    #[test]
+    fn records_resolved_expert_graphs_and_environment_dependence() {
+        let filters = vec![
+            FilterSpec::parse("high-pass:frequency=300").unwrap(),
+            FilterSpec::parse("expert-audio-graph:volume=1.5,aecho=0.8:0.9:20:0.2").unwrap(),
+        ];
+
+        let plan = PipelinePlan::build(MediaFormat::Mp3, filters, 42).unwrap();
+
+        assert!(plan.environment_dependent);
+        assert!(plan.stages[0].environment_dependent);
+        assert_eq!(
+            plan.stages[0].resolved_graph.as_deref(),
+            Some("highpass=f=300,volume=1.5,aecho=0.8:0.9:20:0.2")
+        );
     }
 }

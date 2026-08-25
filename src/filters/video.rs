@@ -11,6 +11,7 @@ pub fn compile_video_graph(filters: &[FilterSpec]) -> Result<String> {
             FilterSpec::VideoEffect(VideoEffect::Lag { frames }) => {
                 Ok(format!("tmix=frames={}", frames + 1))
             }
+            FilterSpec::ExpertVideoGraph(graph) => Ok(graph.fragment().to_owned()),
             _ => Err(DatabenderError::OutputValidation {
                 reason: format!(
                     "filter {} cannot be compiled into an FFmpeg video graph",

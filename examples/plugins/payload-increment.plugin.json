@@ -1,0 +1,17 @@
+{
+  "manifest_version": 1,
+  "abi_version": 1,
+  "id": "org.databender.example.payload-increment",
+  "name": "Payload Increment Example",
+  "version": "1.0.0",
+  "filters": [
+    {
+      "id": "increment",
+      "name": "Increment",
+      "description": "Returns the conformance fixture with its mutable payload byte incremented",
+      "domains": ["encoded-payload"],
+      "deterministic": true,
+      "parameters": []
+    }
+  ]
+}

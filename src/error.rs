@@ -6,6 +6,9 @@ pub type Result<T> = std::result::Result<T, DatabenderError>;
 
 #[derive(Debug, Error)]
 pub enum DatabenderError {
+    #[error("operation cancelled")]
+    Cancelled,
+
     #[error("could not detect the media format for {path}")]
     FormatDetection { path: PathBuf },
 
@@ -24,6 +27,9 @@ pub enum DatabenderError {
 
     #[error("invalid value for {parameter}: {reason}")]
     InvalidParameter { parameter: String, reason: String },
+
+    #[error("invalid configuration {path}: {reason}")]
+    InvalidConfiguration { path: PathBuf, reason: String },
 
     #[error("refusing to overwrite existing output {path}")]
     OutputExists { path: PathBuf },

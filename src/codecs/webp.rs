@@ -8,6 +8,14 @@ pub(crate) struct MetadataChunk {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AnimationInfo {
+    pub width: u32,
+    pub height: u32,
+    pub loop_count: u16,
+    pub frame_durations_ms: Vec<u32>,
+}
+
 pub(crate) fn extract_metadata(encoded: &[u8]) -> Result<Vec<MetadataChunk>> {
     Ok(parse_chunks(encoded)?
         .into_iter()
@@ -27,6 +35,9 @@ pub(crate) fn inject_metadata(encoded: &[u8], metadata: &[MetadataChunk]) -> Res
     let (width, height, alpha) = canvas(&chunks)?;
     let mut body = b"WEBP".to_vec();
     let mut flags = if alpha { 0x10 } else { 0 };
+    if chunks.iter().any(|chunk| chunk.kind == *b"ANMF") {
+        flags |= 0x02;
+    }
     for chunk in metadata {
         flags |= match &chunk.kind {
             b"ICCP" => 0x20,
@@ -57,11 +68,39 @@ pub(crate) fn inject_metadata(encoded: &[u8], metadata: &[MetadataChunk]) -> Res
     Ok(output)
 }
 
-pub(crate) fn is_animated(encoded: &[u8]) -> Result<bool> {
+pub(crate) fn animation_info(encoded: &[u8]) -> Result<Option<AnimationInfo>> {
     let chunks = parse_chunks(encoded)?;
-    Ok(chunks.iter().any(|chunk| {
-        matches!(&chunk.kind, b"ANIM" | b"ANMF")
-            || (chunk.kind == *b"VP8X" && chunk.data.first().is_some_and(|flags| flags & 0x02 != 0))
+    if !chunks.iter().any(|chunk| chunk.kind == *b"ANMF") {
+        return Ok(None);
+    }
+    let (width, height, _) = canvas(&chunks)?;
+    let animation = chunks
+        .iter()
+        .find(|chunk| chunk.kind == *b"ANIM")
+        .ok_or_else(|| invalid_webp("animation frames are missing the ANIM chunk"))?;
+    if animation.data.len() != 6 {
+        return Err(invalid_webp("ANIM chunk must contain 6 bytes"));
+    }
+    let loop_count = u16::from_le_bytes(animation.data[4..6].try_into().unwrap());
+    let frame_durations_ms = chunks
+        .iter()
+        .filter(|chunk| chunk.kind == *b"ANMF")
+        .map(|chunk| {
+            if chunk.data.len() < 16 {
+                return Err(invalid_webp("ANMF chunk is shorter than its frame header"));
+            }
+            let duration = read_u24(&chunk.data[12..15]);
+            if duration == 0 {
+                return Err(invalid_webp("animation frame duration must be positive"));
+            }
+            Ok(duration)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(AnimationInfo {
+        width,
+        height,
+        loop_count,
+        frame_durations_ms,
     }))
 }
 
@@ -179,7 +218,7 @@ mod tests {
         let encoded = inject_metadata(&fixture(), &metadata).unwrap();
 
         assert_eq!(extract_metadata(&encoded).unwrap(), metadata);
-        assert!(!is_animated(&encoded).unwrap());
+        assert_eq!(animation_info(&encoded).unwrap(), None);
         assert_eq!(
             canvas(&parse_chunks(&encoded).unwrap()).unwrap(),
             (1, 1, true)
@@ -199,10 +238,38 @@ mod tests {
         let mut body = encoded.split_off(12);
         encoded.truncate(12);
         write_chunk(&mut encoded, *b"ANIM", &[0; 6]).unwrap();
+        let mut frame = vec![0; 16];
+        frame[12] = 1;
+        write_chunk(&mut encoded, *b"ANMF", &frame).unwrap();
         encoded.append(&mut body);
         let riff_size = u32::try_from(encoded.len() - 8).unwrap();
         encoded[4..8].copy_from_slice(&riff_size.to_le_bytes());
 
-        assert!(is_animated(&encoded).unwrap());
+        assert!(animation_info(&encoded).unwrap().is_some());
+    }
+
+    #[test]
+    fn parses_animation_timing_and_loop_count() {
+        let mut body = b"WEBP".to_vec();
+        write_chunk(&mut body, *b"VP8X", &[0x12, 0, 0, 0, 3, 0, 0, 1, 0, 0]).unwrap();
+        write_chunk(&mut body, *b"ANIM", &[0, 0, 0, 0, 7, 0]).unwrap();
+        for duration in [125_u32, 340] {
+            let mut frame = vec![0; 16];
+            frame[12..15].copy_from_slice(&duration.to_le_bytes()[..3]);
+            write_chunk(&mut body, *b"ANMF", &frame).unwrap();
+        }
+        let mut encoded = b"RIFF".to_vec();
+        encoded.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&body);
+
+        assert_eq!(
+            animation_info(&encoded).unwrap(),
+            Some(AnimationInfo {
+                width: 4,
+                height: 2,
+                loop_count: 7,
+                frame_durations_ms: vec![125, 340],
+            })
+        );
     }
 }
