@@ -44,7 +44,7 @@
 ### WebP and AVIF Images
 
 - [x] Apply the existing image-pixel filters to still WebP and AVIF images, preserving dimensions and alpha.
-- [ ] Preserve and validate supported EXIF, XMP, ICC, orientation, and color metadata for both formats.
+- [x] Preserve and validate supported EXIF, XMP, ICC, orientation, and color metadata for both formats.
 - [x] Reject animated WebP and image-sequence AVIF before processing until frame timing and animation metadata have explicit contracts.
 
 ### Ogg Audio
@@ -153,18 +153,18 @@
 
 ### Progressive JPEG Reconstruction
 
-- [ ] Decode baseline and progressive JPEG scans into quantized coefficient blocks, including DC/AC first scans, refinement scans, restart intervals, and component/table selection.
-- [ ] Apply Huffman glitches to reconstructed coefficient and symbol data with explicit scan, component, frequency-band, and impact controls.
-- [ ] Re-encode valid entropy scans and DHT segments while preserving quantization tables, sampling geometry, restart behavior, and supported metadata.
+- [x] Decode baseline and progressive JPEG scans into quantized coefficient blocks, including DC/AC first scans, refinement scans, restart intervals, and component/table selection.
+- [x] Apply Huffman glitches to reconstructed coefficient and symbol data with explicit scan, component, frequency-band, and impact controls.
+- [x] Re-encode valid entropy scans and DHT segments while preserving quantization tables, sampling geometry, restart behavior, and supported metadata.
 - [x] Keep the existing deterministic table-level fallback available as a compatibility mode and document how its output differs from coefficient reconstruction.
 
 ### Safety, Compatibility, and Release Gates
 
-- [ ] Add corpus, property, mutation, and coverage-guided fuzz tests for every new parser, packet repair path, progressive scan decoder, and plugin ABI boundary.
-- [ ] Add deterministic golden tests and independent decoder checks across supported codecs, containers, operating systems, FFmpeg versions, and plugin runtime versions.
+- [x] Add corpus, property, mutation, and coverage-guided fuzz tests for every new parser, packet repair path, progressive scan decoder, and plugin ABI boundary.
+- [x] Add deterministic golden tests and independent decoder checks across supported codecs, containers, operating systems, FFmpeg versions, and plugin runtime versions.
 - [x] Add resource-exhaustion, cancellation, malicious-plugin, malformed-graph, decompression-bomb, and adversarial-media tests with documented limits.
 - [x] Version encoded-mutation and expert-graph plans so presets and batch manifests fail clearly when behavior or codec support changes.
-- [ ] Benchmark native reconstruction, sandbox overhead, packet mutation, remuxing, and validation; publish stability tiers and operational guidance for each advanced feature.
+- [x] Benchmark native reconstruction, sandbox overhead, packet mutation, remuxing, and validation; publish stability tiers and operational guidance for each advanced feature.
 - [x] Update the specification, architecture, SDK documentation, threat model, support matrix, examples, and migration notes before completing all cross-platform release gates.
 
 ## Deferred

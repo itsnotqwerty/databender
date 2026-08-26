@@ -1,5 +1,5 @@
 use crate::{
-    codecs::jpeg_entropy::{analyze_ac_usage, AcUsage},
+    codecs::jpeg_entropy::{analyze_ac_usage, reconstruct_coefficients, AcUsage, CoefficientImage},
     DatabenderError, HuffmanGlitchMode, HuffmanTarget, Result,
 };
 
@@ -10,6 +10,10 @@ pub(crate) struct HuffmanGlitchOptions {
     pub(crate) target: HuffmanTarget,
     pub(crate) mode: HuffmanGlitchMode,
     pub(crate) preserve_size: bool,
+    pub(crate) scan_start: usize,
+    pub(crate) scan_count: usize,
+    pub(crate) frequency_start: usize,
+    pub(crate) frequency_end: usize,
 }
 
 pub(crate) fn mutate_huffman_tables(
@@ -87,6 +91,366 @@ pub(crate) fn mutate_huffman_tables(
         return Err(invalid_jpeg("missing AC Huffman table"));
     }
     Ok(output)
+}
+
+pub(crate) fn mutate_coefficients(
+    input: &[u8],
+    options: HuffmanGlitchOptions,
+    seed: u64,
+) -> Result<Vec<u8>> {
+    let progressive = has_frame_marker(input, 0xc2)?;
+    let (source, mut coefficients, scan_origins) = if progressive {
+        let reconstructed = reconstruct_coefficients(input)?;
+        let source = baseline_skeleton(input, &reconstructed)?;
+        let scan_origins = reconstructed
+            .components
+            .iter()
+            .map(|component| component.scans.clone())
+            .collect::<Vec<_>>();
+        let coefficients = dct_io::JpegCoefficients {
+            components: reconstructed
+                .components
+                .into_iter()
+                .map(|component| dct_io::ComponentCoefficients {
+                    id: component.id,
+                    blocks: component.blocks,
+                })
+                .collect(),
+        };
+        (source, coefficients, Some(scan_origins))
+    } else {
+        let coefficients = dct_io::read_coefficients(input)
+            .map_err(|error| invalid_jpeg(format!("coefficient decode failed: {error}")))?;
+        (input.to_vec(), coefficients, None)
+    };
+
+    let mutations = if options.intensity == 0.0 {
+        0
+    } else {
+        ((options.swaps as f64) * options.intensity.powi(2))
+            .round()
+            .max(1.0) as usize
+    };
+    let mut rng = SeededRng::new(seed);
+    let eligible_components = coefficients
+        .components
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| match options.target {
+            HuffmanTarget::All => true,
+            HuffmanTarget::LumaAc => *index == 0,
+            HuffmanTarget::ChromaAc => *index > 0,
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if eligible_components.is_empty() {
+        return Err(invalid_jpeg("coefficient target selects no components"));
+    }
+
+    for _ in 0..mutations {
+        let component_index = eligible_components[rng.index(eligible_components.len())];
+        let component = &mut coefficients.components[component_index];
+        if component.blocks.is_empty() {
+            continue;
+        }
+        let block_index = rng.index(component.blocks.len());
+        let block = &mut component.blocks[block_index];
+        let scan_end = options.scan_start.saturating_add(options.scan_count);
+        let populated = (options.frequency_start..=options.frequency_end)
+            .filter(|index| {
+                if block[*index] == 0 {
+                    return false;
+                }
+                let scan = scan_origins.as_ref().map_or(0, |origins| {
+                    usize::from(origins[component_index][block_index][*index])
+                });
+                options.scan_count == 0 || (scan >= options.scan_start && scan < scan_end)
+            })
+            .collect::<Vec<_>>();
+        if populated.is_empty() {
+            continue;
+        }
+        let source_index = populated[rng.index(populated.len())];
+        match options.mode {
+            HuffmanGlitchMode::SymbolRemap => block[source_index] = -block[source_index],
+            HuffmanGlitchMode::RunRemap => {
+                let distance = ((options.intensity * 15.0).ceil() as usize).max(1);
+                let start = source_index
+                    .saturating_sub(distance)
+                    .max(options.frequency_start);
+                let end = (source_index + distance).min(options.frequency_end);
+                let empty = (start..=end)
+                    .filter(|index| block[*index] == 0)
+                    .collect::<Vec<_>>();
+                if !empty.is_empty() {
+                    let destination = empty[rng.index(empty.len())];
+                    block[destination] = block[source_index];
+                    block[source_index] = 0;
+                }
+            }
+        }
+    }
+
+    dct_io::write_coefficients(&source, &coefficients)
+        .map_err(|error| invalid_jpeg(format!("coefficient encode failed: {error}")))
+}
+
+fn has_frame_marker(input: &[u8], expected: u8) -> Result<bool> {
+    if !input.starts_with(&[0xff, 0xd8]) {
+        return Err(invalid_jpeg("missing SOI marker"));
+    }
+    let mut offset = 2;
+    while offset + 4 <= input.len() {
+        if input[offset] != 0xff {
+            return Err(invalid_jpeg("expected marker prefix"));
+        }
+        let marker = input[offset + 1];
+        if marker == expected {
+            return Ok(true);
+        }
+        if marker == 0xda || marker == 0xd9 {
+            return Ok(false);
+        }
+        let length = usize::from(u16::from_be_bytes([input[offset + 2], input[offset + 3]]));
+        offset = offset
+            .checked_add(length + 2)
+            .filter(|end| *end <= input.len())
+            .ok_or_else(|| invalid_jpeg("segment length exceeds file size"))?;
+    }
+    Err(invalid_jpeg("missing frame marker"))
+}
+
+fn baseline_skeleton(input: &[u8], coefficients: &CoefficientImage) -> Result<Vec<u8>> {
+    let estimated_entropy = coefficients.width.saturating_mul(coefficients.height) / 2;
+    let mut output = Vec::with_capacity(input.len().max(estimated_entropy));
+    output.extend([0xff, 0xd8]);
+    let mut offset = 2;
+    let mut restart_interval = 0_usize;
+    let mut found_frame = false;
+    while offset + 4 <= input.len() {
+        if input[offset] != 0xff {
+            return Err(invalid_jpeg(
+                "expected marker prefix before progressive scan",
+            ));
+        }
+        let marker = input[offset + 1];
+        if marker == 0xda {
+            break;
+        }
+        let length = usize::from(u16::from_be_bytes([input[offset + 2], input[offset + 3]]));
+        let end = offset
+            .checked_add(length + 2)
+            .filter(|end| *end <= input.len())
+            .ok_or_else(|| invalid_jpeg("segment length exceeds file size"))?;
+        if marker == 0xdd && length == 4 {
+            restart_interval =
+                usize::from(u16::from_be_bytes([input[offset + 4], input[offset + 5]]));
+        }
+        if marker != 0xc4 {
+            output.extend_from_slice(&input[offset..end]);
+            if marker == 0xc2 {
+                let marker_index = output.len() - (end - offset) + 1;
+                output[marker_index] = 0xc0;
+                found_frame = true;
+            }
+        }
+        offset = end;
+    }
+    if !found_frame {
+        return Err(invalid_jpeg("missing progressive frame"));
+    }
+
+    let huffman_segments = standard_huffman_segments()?;
+    for segment in &huffman_segments {
+        output.extend_from_slice(segment);
+    }
+    let mut scan = Vec::with_capacity(1 + coefficients.components.len() * 2 + 3);
+    scan.push(coefficients.components.len() as u8);
+    for component in &coefficients.components {
+        scan.push(component.id);
+        scan.push(if component.luma { 0x00 } else { 0x11 });
+    }
+    scan.extend([0, 63, 0]);
+    append_segment(&mut output, 0xda, &scan)?;
+    append_zero_entropy(
+        &mut output,
+        coefficients,
+        &huffman_segments,
+        restart_interval,
+    )?;
+    output.extend([0xff, 0xd9]);
+    Ok(output)
+}
+
+fn standard_huffman_segments() -> Result<Vec<Vec<u8>>> {
+    let image = image::ImageBuffer::from_pixel(1, 1, image::Rgb([128_u8, 128, 128]));
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut encoded)
+        .encode_image(&image)
+        .map_err(|error| invalid_jpeg(format!("failed to build standard tables: {error}")))?;
+    let mut segments = Vec::new();
+    let mut offset = 2;
+    while offset + 4 <= encoded.len() {
+        let marker = encoded[offset + 1];
+        if marker == 0xda {
+            break;
+        }
+        let length = usize::from(u16::from_be_bytes([
+            encoded[offset + 2],
+            encoded[offset + 3],
+        ]));
+        let end = offset + length + 2;
+        if marker == 0xc4 {
+            segments.push(encoded[offset..end].to_vec());
+        }
+        offset = end;
+    }
+    if segments.is_empty() {
+        return Err(invalid_jpeg("standard encoder emitted no Huffman tables"));
+    }
+    Ok(segments)
+}
+
+#[derive(Clone, Copy)]
+struct EncodeCode {
+    bits: u16,
+    length: u8,
+}
+
+fn zero_code(segments: &[Vec<u8>], selector: u8) -> Result<EncodeCode> {
+    for segment in segments {
+        let mut offset = 4;
+        while offset < segment.len() {
+            let table_selector = segment[offset];
+            let counts = &segment[offset + 1..offset + 17];
+            let symbol_count = counts
+                .iter()
+                .map(|count| usize::from(*count))
+                .sum::<usize>();
+            let symbols = &segment[offset + 17..offset + 17 + symbol_count];
+            let mut code = 0_u16;
+            let mut symbol_index = 0;
+            for (length_index, count) in counts.iter().enumerate() {
+                for _ in 0..*count {
+                    if table_selector == selector && symbols[symbol_index] == 0 {
+                        return Ok(EncodeCode {
+                            bits: code,
+                            length: (length_index + 1) as u8,
+                        });
+                    }
+                    code += 1;
+                    symbol_index += 1;
+                }
+                code <<= 1;
+            }
+            offset += 17 + symbol_count;
+        }
+    }
+    Err(invalid_jpeg("standard Huffman table has no zero symbol"))
+}
+
+fn append_zero_entropy(
+    output: &mut Vec<u8>,
+    coefficients: &CoefficientImage,
+    huffman_segments: &[Vec<u8>],
+    restart_interval: usize,
+) -> Result<()> {
+    let luma_dc = zero_code(huffman_segments, 0x00)?;
+    let luma_ac = zero_code(huffman_segments, 0x10)?;
+    let chroma_dc = zero_code(huffman_segments, 0x01)?;
+    let chroma_ac = zero_code(huffman_segments, 0x11)?;
+    let first = coefficients
+        .components
+        .first()
+        .ok_or_else(|| invalid_jpeg("coefficient image has no components"))?;
+    let mcu_columns = first.blocks_wide / first.horizontal_sampling;
+    let mcu_rows = first.blocks_high / first.vertical_sampling;
+    let mut writer = SkeletonBitWriter::new(output);
+    let mut mcu_index = 0_usize;
+    let mut restart_index = 0_u8;
+    for _ in 0..mcu_rows {
+        for _ in 0..mcu_columns {
+            if restart_interval > 0 && mcu_index > 0 && mcu_index.is_multiple_of(restart_interval) {
+                writer.restart(restart_index);
+                restart_index = (restart_index + 1) & 7;
+            }
+            for component in &coefficients.components {
+                let block_count = component.horizontal_sampling * component.vertical_sampling;
+                let (dc, ac) = if component.luma {
+                    (luma_dc, luma_ac)
+                } else {
+                    (chroma_dc, chroma_ac)
+                };
+                for _ in 0..block_count {
+                    writer.write(dc);
+                    writer.write(ac);
+                }
+            }
+            mcu_index += 1;
+        }
+    }
+    writer.finish();
+    Ok(())
+}
+
+struct SkeletonBitWriter<'a> {
+    output: &'a mut Vec<u8>,
+    current: u8,
+    used: u8,
+}
+
+impl<'a> SkeletonBitWriter<'a> {
+    fn new(output: &'a mut Vec<u8>) -> Self {
+        Self {
+            output,
+            current: 0,
+            used: 0,
+        }
+    }
+
+    fn write(&mut self, code: EncodeCode) {
+        for shift in (0..code.length).rev() {
+            self.current = (self.current << 1) | ((code.bits >> shift) as u8 & 1);
+            self.used += 1;
+            if self.used == 8 {
+                self.flush_byte();
+            }
+        }
+    }
+
+    fn restart(&mut self, index: u8) {
+        self.pad();
+        self.output.extend([0xff, 0xd0 + index]);
+    }
+
+    fn finish(&mut self) {
+        self.pad();
+    }
+
+    fn pad(&mut self) {
+        if self.used > 0 {
+            self.current = (self.current << (8 - self.used)) | ((1_u8 << (8 - self.used)) - 1);
+            self.flush_byte();
+        }
+    }
+
+    fn flush_byte(&mut self) {
+        self.output.push(self.current);
+        if self.current == 0xff {
+            self.output.push(0);
+        }
+        self.current = 0;
+        self.used = 0;
+    }
+}
+
+fn append_segment(output: &mut Vec<u8>, marker: u8, payload: &[u8]) -> Result<()> {
+    let length = u16::try_from(payload.len() + 2)
+        .map_err(|_| invalid_jpeg("segment exceeds JPEG length limit"))?;
+    output.extend([0xff, marker]);
+    output.extend(length.to_be_bytes());
+    output.extend_from_slice(payload);
+    Ok(())
 }
 
 fn mutate_dht_segment(
@@ -312,6 +676,7 @@ fn invalid_jpeg(reason: impl Into<String>) -> DatabenderError {
 #[cfg(test)]
 mod tests {
     use image::{ImageBuffer, Rgb};
+    use sha2::{Digest, Sha256};
 
     use super::*;
 
@@ -331,6 +696,10 @@ mod tests {
             target: HuffmanTarget::All,
             mode: HuffmanGlitchMode::RunRemap,
             preserve_size: true,
+            scan_start: 0,
+            scan_count: 0,
+            frequency_start: 1,
+            frequency_end: 63,
         }
     }
 
@@ -413,6 +782,86 @@ mod tests {
         assert_ne!(first, input);
         assert_eq!(first.len(), input.len());
         assert!(image::load_from_memory(&first).is_ok());
+    }
+
+    #[test]
+    fn mutates_coefficients_deterministically_and_reencodes_valid_jpeg() {
+        let input = textured_fixture();
+        let mut coefficient_options = options(16);
+        coefficient_options.mode = HuffmanGlitchMode::SymbolRemap;
+
+        let first = mutate_coefficients(&input, coefficient_options, 42).unwrap();
+        let second = mutate_coefficients(&input, coefficient_options, 42).unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, input);
+        assert!(image::load_from_memory(&first).is_ok());
+        assert_eq!(
+            extract_metadata(&first).unwrap(),
+            extract_metadata(&input).unwrap()
+        );
+    }
+
+    #[test]
+    fn reconstructs_and_reencodes_progressive_coefficients() {
+        let input = crate::codecs::jpeg_entropy::tests::progressive_fixture();
+        let mut coefficient_options = options(1);
+        coefficient_options.mode = HuffmanGlitchMode::SymbolRemap;
+        coefficient_options.scan_start = 3;
+        coefficient_options.scan_count = 1;
+        coefficient_options.frequency_start = 1;
+        coefficient_options.frequency_end = 1;
+
+        let output = mutate_coefficients(&input, coefficient_options, 42).unwrap();
+        let output_coefficients = dct_io::read_coefficients(&output).unwrap();
+
+        assert!(image::load_from_memory(&output).is_ok());
+        assert!(!has_frame_marker(&output, 0xc2).unwrap());
+        assert_eq!(output_coefficients.components[0].blocks[0][0], 3);
+        assert_eq!(output_coefficients.components[0].blocks[0][1], -3);
+    }
+
+    #[test]
+    fn preserves_progressive_restart_interval_when_reencoding() {
+        let input = crate::codecs::jpeg_entropy::tests::progressive_restart_fixture();
+        let mut coefficient_options = options(1);
+        coefficient_options.mode = HuffmanGlitchMode::SymbolRemap;
+        coefficient_options.scan_start = 3;
+        coefficient_options.scan_count = 1;
+        coefficient_options.frequency_start = 1;
+        coefficient_options.frequency_end = 1;
+
+        let output = mutate_coefficients(&input, coefficient_options, 42).unwrap();
+
+        assert!(output
+            .windows(6)
+            .any(|bytes| bytes == [0xff, 0xdd, 0, 4, 0, 1]));
+        assert!(output
+            .windows(2)
+            .any(|bytes| bytes[0] == 0xff && (0xd0..=0xd7).contains(&bytes[1])));
+        image::load_from_memory(&output).unwrap();
+    }
+
+    #[test]
+    fn progressive_coefficient_output_matches_golden_digest() {
+        let input = crate::codecs::jpeg_entropy::tests::progressive_fixture();
+        let mut coefficient_options = options(1);
+        coefficient_options.mode = HuffmanGlitchMode::SymbolRemap;
+        coefficient_options.scan_start = 3;
+        coefficient_options.scan_count = 1;
+        coefficient_options.frequency_start = 1;
+        coefficient_options.frequency_end = 1;
+
+        let output = mutate_coefficients(&input, coefficient_options, 42).unwrap();
+        let digest: [u8; 32] = Sha256::digest(output).into();
+
+        assert_eq!(
+            digest,
+            [
+                255, 221, 224, 172, 14, 74, 114, 3, 50, 96, 144, 173, 55, 169, 189, 56, 252, 198,
+                65, 89, 177, 73, 28, 31, 183, 247, 125, 118, 55, 206, 132, 200,
+            ]
+        );
     }
 
     #[test]

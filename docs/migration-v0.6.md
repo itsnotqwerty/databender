@@ -30,7 +30,7 @@ The v1 runtime validates media topology and applies memory, message, instance, t
 
 ## Image and Container Validation
 
-Still-image decoding now rejects either dimension above 16,384 pixels and limits decoder-tracked allocation to 512 MiB. AVIF EXIF is preserved for still images; unsupported AVIF ICC/XMP/color-property reconstruction remains outside the current guarantee.
+Still-image decoding now rejects either dimension above 16,384 pixels and limits decoder-tracked allocation to 512 MiB. Still AVIF transforms preserve and validate Exif and XMP items, ICC/CICP color properties, and `irot`/`imir` orientation properties. Inputs using unsupported item-location layouts fail before publication instead of silently dropping metadata.
 
 Encoded MP3, Ogg, and MP4 candidates are reparsed and fully decoded before atomic publication. MP4 additionally verifies codec, dimensions, frame rate, metadata, audio topology, and the configured selected-stream frame-loss bound. These checks can reject corruptions accepted by earlier versions; lower mutation intensity or damage limits rather than bypassing validation.
 

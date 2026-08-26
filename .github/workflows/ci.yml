@@ -30,3 +30,23 @@ jobs:
       - name: Fuzz target compilation
         if: runner.os == 'Linux'
         run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+  compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        ffmpeg-version: ["6.1", "7.1"]
+        wasmtime-version: ["39.0.2", "40.0.4"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+        with:
+          ffmpeg-version: ${{ matrix.ffmpeg-version }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - name: Select plugin runtime
+        run: cargo update -p wasmtime --precise ${{ matrix.wasmtime-version }}
+      - name: Compatibility tests
+        run: cargo test --all-targets

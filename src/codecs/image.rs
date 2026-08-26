@@ -53,24 +53,37 @@ pub fn execute(prepared: PreparedTransform) -> Result<std::path::PathBuf> {
                         swaps,
                         intensity,
                         target,
-                        engine: _,
+                        engine,
                         mode,
                         preserve_size,
+                        scan_start,
+                        scan_count,
+                        frequency_start,
+                        frequency_end,
                     } = filter
                     else {
                         unreachable!("Huffman stages only contain Huffman filters")
                     };
-                    encoded = jpeg::mutate_huffman_tables(
-                        &encoded,
-                        jpeg::HuffmanGlitchOptions {
-                            swaps: *swaps,
-                            intensity: *intensity,
-                            target: *target,
-                            mode: *mode,
-                            preserve_size: *preserve_size,
-                        },
-                        stage.seed.wrapping_add(filter_index as u64),
-                    )?;
+                    let options = jpeg::HuffmanGlitchOptions {
+                        swaps: *swaps,
+                        intensity: *intensity,
+                        target: *target,
+                        mode: *mode,
+                        preserve_size: *preserve_size,
+                        scan_start: *scan_start,
+                        scan_count: *scan_count,
+                        frequency_start: *frequency_start,
+                        frequency_end: *frequency_end,
+                    };
+                    let seed = stage.seed.wrapping_add(filter_index as u64);
+                    encoded = match engine {
+                        crate::HuffmanGlitchEngine::Table => {
+                            jpeg::mutate_huffman_tables(&encoded, options, seed)?
+                        }
+                        crate::HuffmanGlitchEngine::Coefficient => {
+                            jpeg::mutate_coefficients(&encoded, options, seed)?
+                        }
+                    };
                 }
             }
             FilterDomain::ImagePixels => {
@@ -564,7 +577,7 @@ impl ImageMetadata {
 
     fn inject(&self, encoded: &[u8]) -> Result<Vec<u8>> {
         match self {
-            Self::Avif(_) => Ok(encoded.to_vec()),
+            Self::Avif(metadata) => avif::inject_metadata(encoded, metadata),
             Self::Jpeg(metadata) => jpeg::inject_metadata(encoded, metadata),
             Self::Png(metadata) => png::inject_metadata(encoded, metadata),
             Self::WebP(metadata) => webp::inject_metadata(encoded, metadata),
@@ -578,6 +591,48 @@ fn decode(path: &Path) -> Result<RgbaImage> {
         source,
     })?;
     decode_bytes(&encoded, path)
+}
+
+#[doc(hidden)]
+pub fn fuzz_image_container(format: MediaFormat, encoded: &[u8]) {
+    match format {
+        MediaFormat::Jpeg => {
+            let _ = jpeg::extract_metadata(encoded);
+            let _ = crate::codecs::jpeg_entropy::analyze_ac_usage(encoded);
+            let _ = crate::codecs::jpeg_entropy::reconstruct_coefficients(encoded);
+            if encoded.len() <= 1024 * 1024 {
+                let _ = jpeg::mutate_coefficients(
+                    encoded,
+                    jpeg::HuffmanGlitchOptions {
+                        swaps: 1,
+                        intensity: 0.5,
+                        target: crate::HuffmanTarget::All,
+                        mode: crate::HuffmanGlitchMode::SymbolRemap,
+                        preserve_size: true,
+                        scan_start: 0,
+                        scan_count: 0,
+                        frequency_start: 1,
+                        frequency_end: 63,
+                    },
+                    42,
+                );
+            }
+        }
+        MediaFormat::Png => {
+            let _ = png::extract_metadata(encoded);
+        }
+        MediaFormat::WebP => {
+            let _ = webp::extract_metadata(encoded);
+            let _ = webp::animation_info(encoded);
+        }
+        MediaFormat::Avif => {
+            let _ = avif::extract_metadata(encoded);
+            if is_avif_sequence(encoded) {
+                let _ = avif_sequence::parse(encoded);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn decode_bytes(encoded: &[u8], source: &Path) -> Result<RgbaImage> {
@@ -629,7 +684,10 @@ fn encode(
         ),
         MediaFormat::Avif => {
             let mut encoder = AvifEncoder::new_with_speed_quality(&mut encoded, 6, 90);
-            if let Some(ImageMetadata::Avif(avif::Metadata { exif: Some(exif) })) = metadata {
+            if let Some(ImageMetadata::Avif(avif::Metadata {
+                exif: Some(exif), ..
+            })) = metadata
+            {
                 encoder.set_exif_metadata(exif.clone()).map_err(|error| {
                     DatabenderError::ImageEncode {
                         format: format.to_string(),
@@ -798,6 +856,9 @@ mod tests {
         let exif = b"II\x2a\0\x08\0\0\0\0\0\0\0".to_vec();
         let metadata = ImageMetadata::Avif(avif::Metadata {
             exif: Some(exif.clone()),
+            xmp: None,
+            color: None,
+            orientation: Vec::new(),
         });
         fs::write(
             &input,
@@ -815,8 +876,48 @@ mod tests {
         assert_eq!(
             avif::extract_metadata(&fs::read(output).unwrap()).unwrap(),
             avif::Metadata {
-                exif: Some(expected)
+                exif: Some(expected),
+                xmp: None,
+                color: None,
+                orientation: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn preserves_all_supported_avif_metadata_across_pixel_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.avif");
+        let output = directory.path().join("output.avif");
+        let image = ImageBuffer::from_pixel(2, 2, Rgba([10, 20, 30, 255]));
+        let metadata = ImageMetadata::Avif(avif::Metadata {
+            exif: Some(b"II\x2a\0\x08\0\0\0\0\0\0\0".to_vec()),
+            xmp: Some(b"<x:xmpmeta>fixture</x:xmpmeta>".to_vec()),
+            color: Some([b"nclx".as_slice(), &[0, 1, 0, 13, 0, 6, 0x80]].concat()),
+            orientation: vec![
+                avif::MetadataProperty {
+                    kind: *b"irot",
+                    data: vec![1],
+                },
+                avif::MetadataProperty {
+                    kind: *b"imir",
+                    data: vec![1],
+                },
+            ],
+        });
+        let encoded = encode(MediaFormat::Avif, &image, Some(&metadata)).unwrap();
+        let encoded = metadata.inject(&encoded).unwrap();
+        let expected = ImageMetadata::extract(MediaFormat::Avif, &encoded).unwrap();
+        fs::write(&input, encoded).unwrap();
+
+        let prepared = TransformRequest::new(input, &output, vec![FilterSpec::Invert], 42)
+            .prepare()
+            .unwrap();
+        execute(prepared).unwrap();
+
+        assert_eq!(
+            ImageMetadata::extract(MediaFormat::Avif, &fs::read(output).unwrap()).unwrap(),
+            expected
         );
     }
 

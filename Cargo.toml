@@ -8,6 +8,7 @@ description = "Deterministic, structure-aware media databending"
 clap = { version = "4.5", features = ["derive"] }
 crc32fast = "1.5"
 crossterm = "0.28"
+dct-io = "0.1.1"
 flate2 = "1.1"
 image = { version = "0.25", default-features = false, features = ["avif", "avif-native", "jpeg", "png", "webp"] }
 rand = "0.9"
@@ -19,7 +20,7 @@ tempfile = "3.20"
 thiserror = "2.0"
 toml = "0.9"
 wait-timeout = "0.2.1"
-wasmtime = { version = "40.0", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
+wasmtime = { version = ">=39, <41", default-features = false, features = ["cranelift", "runtime", "std", "wat"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

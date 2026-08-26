@@ -33,5 +33,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "image_containers"
+path = "fuzz_targets/image_containers.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

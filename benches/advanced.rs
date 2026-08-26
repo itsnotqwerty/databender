@@ -4,6 +4,7 @@ use std::{
     fs,
     hint::black_box,
     path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -11,8 +12,10 @@ use databender::{
     codecs::encoded_video::mutate_packet,
     ffmpeg::ToolRunner,
     plugin::{PluginPixelFormat, PluginValue, PLUGIN_ABI_VERSION},
-    CancellationToken, PluginInvocation, PluginMedia, PluginSandboxLimits, WasmPluginRuntime,
+    CancellationToken, FilterSpec, PluginInvocation, PluginMedia, PluginSandboxLimits,
+    TransformRequest, WasmPluginRuntime,
 };
+use image::{codecs::avif::AvifEncoder, ExtendedColorType, ImageEncoder};
 
 const PACKET_ITERATIONS: u32 = 10_000;
 const SANDBOX_ITERATIONS: u32 = 100;
@@ -22,10 +25,94 @@ fn main() {
     println!("databender advanced benchmark");
     benchmark_packet_mutation();
     benchmark_sandbox();
+    if let Err(error) = benchmark_native_image_validation() {
+        println!("native image validation\tunavailable\t{error}");
+    }
     if let Err(error) = benchmark_remux_and_validation() {
         println!("remux/validation\tunavailable\t{error}");
     }
-    println!("native reconstruction\tunavailable\tprogressive coefficient engine not implemented");
+    if let Err(error) = benchmark_native_reconstruction() {
+        println!("native reconstruction\tunavailable\t{error}");
+    }
+}
+
+fn benchmark_native_reconstruction() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let baseline = workspace.path().join("baseline.jpg");
+    let input = workspace.path().join("progressive.jpg");
+    let image = image::ImageBuffer::from_fn(512, 512, |x, y| {
+        image::Rgb([
+            (x.wrapping_mul(7) & 0xff) as u8,
+            (y.wrapping_mul(11) & 0xff) as u8,
+            (x.wrapping_add(y).wrapping_mul(5) & 0xff) as u8,
+        ])
+    });
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85).encode_image(&image)?;
+    fs::write(&baseline, encoded)?;
+    let status = Command::new("jpegtran")
+        .arg("-progressive")
+        .arg("-outfile")
+        .arg(&input)
+        .arg(&baseline)
+        .status()?;
+    if !status.success() {
+        return Err("jpegtran could not generate the progressive fixture".into());
+    }
+
+    let filter = FilterSpec::parse(
+        "huffman-glitch:engine=coefficient,swaps=128,intensity=0.5,scan_start=1,scan_count=4,frequency_start=1,frequency_end=32",
+    )?;
+    let started = Instant::now();
+    for iteration in 0..MEDIA_ITERATIONS {
+        let output = workspace
+            .path()
+            .join(format!("reconstructed-{iteration}.jpg"));
+        let prepared =
+            TransformRequest::new(&input, &output, vec![filter.clone()], 42).prepare()?;
+        databender::codecs::execute(prepared)?;
+        black_box(fs::metadata(output)?.len());
+    }
+    print_rate(
+        "progressive JPEG coefficient reconstruction + validation",
+        MEDIA_ITERATIONS,
+        started.elapsed(),
+    );
+    Ok(())
+}
+
+fn benchmark_native_image_validation() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = tempfile::tempdir()?;
+    let input = workspace.path().join("input.avif");
+    let mut encoded = Vec::new();
+    let pixels = vec![128_u8; 512 * 512 * 4];
+    AvifEncoder::new_with_speed_quality(&mut encoded, 10, 75).write_image(
+        &pixels,
+        512,
+        512,
+        ExtendedColorType::Rgba8,
+    )?;
+    fs::write(&input, encoded)?;
+
+    let started = Instant::now();
+    for iteration in 0..MEDIA_ITERATIONS {
+        let output = workspace.path().join(format!("native-{iteration}.avif"));
+        let prepared = TransformRequest::new(
+            &input,
+            &output,
+            vec![FilterSpec::Invert],
+            u64::from(iteration),
+        )
+        .prepare()?;
+        databender::codecs::execute(prepared)?;
+        black_box(fs::metadata(output)?.len());
+    }
+    print_rate(
+        "native AVIF transform + validation",
+        MEDIA_ITERATIONS,
+        started.elapsed(),
+    );
+    Ok(())
 }
 
 fn benchmark_packet_mutation() {

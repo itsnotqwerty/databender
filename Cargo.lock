@@ -712,6 +712,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "crossterm",
+ "dct-io",
  "flate2",
  "image",
  "predicates",
@@ -749,6 +750,12 @@ dependencies = [
  "libc",
  "system-deps",
 ]
+
+[[package]]
+name = "dct-io"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aa783e53cf5500edb663764e888a4755665fdb0a320aff05ef7fec7508aa409"
 
 [[package]]
 name = "difflib"

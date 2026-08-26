@@ -18,23 +18,24 @@ Run the stable custom benchmark with:
 cargo bench --bench advanced
 ```
 
-It measures a 64 KiB H.264 packet with an eight-byte mutation budget, complete compile/instantiate/execute/validate cycles for the packaged image plugin, five stream-copy remuxes of a generated two-second 320x180 H.264 MP4, and five ffprobe plus complete FFmpeg decode validations of that fixture. On the baseline host described above:
+It measures a 64 KiB H.264 packet with an eight-byte mutation budget, complete compile/instantiate/execute/validate cycles for the packaged image plugin, five native 512x512 AVIF transforms, five progressive 512x512 JPEG coefficient reconstructions, five stream-copy remuxes of a generated two-second 320x180 H.264 MP4, and five ffprobe plus complete FFmpeg decode validations. On the baseline host described above:
 
 | Operation | Iterations | Mean |
 | --- | ---: | ---: |
-| H.264 packet mutation | 10,000 | 0.054 ms |
-| WebAssembly sandbox invocation | 100 | 1.172 ms |
-| MP4 stream-copy remux | 5 | 55.308 ms |
-| Video probe plus complete decode | 5 | 118.554 ms |
+| H.264 packet mutation | 10,000 | 0.055 ms |
+| WebAssembly sandbox invocation | 100 | 1.265 ms |
+| Native AVIF transform plus validation | 5 | 535.091 ms |
+| Progressive JPEG coefficient reconstruction plus validation | 5 | 29.880 ms |
+| MP4 stream-copy remux | 5 | 57.380 ms |
+| Video probe plus complete decode | 5 | 138.403 ms |
 
-The executable reports unavailable components instead of silently omitting them. Progressive JPEG coefficient reconstruction is currently unavailable and therefore has no native-reconstruction result. Numbers include Wasmtime compilation for every sandbox invocation and process startup for every remux, probe, and decode, matching the current execution paths rather than an amortized lower bound.
+The executable reports unavailable components instead of silently omitting them. The reconstruction fixture uses `jpegtran` to produce progressive input; the codec itself remains pure Rust. Numbers include Wasmtime compilation for every sandbox invocation and process startup for every remux, probe, and decode, matching current execution paths rather than an amortized lower bound.
 
 Advanced feature stability tiers are:
 
 - **Stable:** native structural parsers, typed image/audio filters, MP3/Ogg encoded mutation, atomic publication, and plugin ABI v1 validation.
-- **Experimental:** MP4 and Matroska encoded-video packet mutation. It is packet-only and codec-dependent; MP4 requires exact SHA-256 verification of sample offsets, while Matroska resolves exact unlaced block payloads by size and hash.
+- **Experimental:** progressive JPEG coefficient mutation plus MP4 and Matroska encoded-video packet mutation. JPEG output is sequential and independently decoded; packet mutation remains codec-dependent.
 - **Environment-dependent:** FFmpeg remuxing, expert graphs, and encoded bytes produced by external codecs. Geometry and metadata contracts are stable; compressed bytes are not cross-build golden values.
-- **Unavailable:** progressive JPEG coefficient reconstruction. Discovery and parsing fail closed rather than exposing partial behavior.
 
 Benchmark results are diagnostic baselines, not pass/fail thresholds. Record the CPU, filesystem, Rust version, FFmpeg version, and enabled encoders when comparing releases.
 

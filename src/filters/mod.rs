@@ -99,6 +99,10 @@ pub enum FilterSpec {
         engine: HuffmanGlitchEngine,
         mode: HuffmanGlitchMode,
         preserve_size: bool,
+        scan_start: usize,
+        scan_count: usize,
+        frequency_start: usize,
+        frequency_end: usize,
     },
     ByteNoise {
         probability: f64,
@@ -194,6 +198,10 @@ impl FilterSpec {
                 engine: parameters.value("engine", HuffmanGlitchEngine::Table)?,
                 mode: parameters.value("mode", HuffmanGlitchMode::RunRemap)?,
                 preserve_size: parameters.value("preserve_size", true)?,
+                scan_start: parameters.bounded("scan_start", 0, 0, 65_535)?,
+                scan_count: parameters.bounded("scan_count", 0, 0, 65_535)?,
+                frequency_start: parameters.bounded("frequency_start", 1, 1, 63)?,
+                frequency_end: parameters.bounded("frequency_end", 63, 1, 63)?,
             },
             "byte-noise" => Self::ByteNoise {
                 probability: parameters.bounded("probability", 0.05, 0.0, 1.0)?,
@@ -289,6 +297,20 @@ impl FilterSpec {
             }
         };
 
+        if let Self::HuffmanGlitch {
+            frequency_start,
+            frequency_end,
+            ..
+        } = &filter
+        {
+            if frequency_start > frequency_end {
+                return Err(invalid_parameter(
+                    name,
+                    "frequency_start",
+                    "must not exceed frequency_end",
+                ));
+            }
+        }
         parameters.finish()?;
         Ok(filter)
     }
@@ -334,6 +356,10 @@ impl FilterSpec {
                 engine,
                 mode,
                 preserve_size,
+                scan_start,
+                scan_count,
+                frequency_start,
+                frequency_end,
             } => {
                 let target_name = match target {
                     HuffmanTarget::All => "all",
@@ -346,6 +372,7 @@ impl FilterSpec {
                 };
                 let engine_name = match engine {
                     HuffmanGlitchEngine::Table => "table",
+                    HuffmanGlitchEngine::Coefficient => "coefficient",
                 };
                 filter_specification(
                     "huffman-glitch",
@@ -357,6 +384,11 @@ impl FilterSpec {
                             .then(|| format!("engine={engine_name}")),
                         (*mode != HuffmanGlitchMode::RunRemap).then(|| format!("mode={mode_name}")),
                         (!*preserve_size).then(|| format!("preserve_size={preserve_size}")),
+                        (*scan_start != 0).then(|| format!("scan_start={scan_start}")),
+                        (*scan_count != 0).then(|| format!("scan_count={scan_count}")),
+                        (*frequency_start != 1)
+                            .then(|| format!("frequency_start={frequency_start}")),
+                        (*frequency_end != 63).then(|| format!("frequency_end={frequency_end}")),
                     ],
                 )
             }
@@ -697,6 +729,7 @@ pub enum HuffmanGlitchMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HuffmanGlitchEngine {
     Table,
+    Coefficient,
 }
 
 impl FromStr for HuffmanGlitchEngine {
@@ -705,7 +738,8 @@ impl FromStr for HuffmanGlitchEngine {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value {
             "table" => Ok(Self::Table),
-            _ => Err("expected table"),
+            "coefficient" => Ok(Self::Coefficient),
+            _ => Err("expected table or coefficient"),
         }
     }
 }
@@ -866,16 +900,20 @@ mod tests {
     fn parses_typed_parameters() {
         assert_eq!(
             FilterSpec::parse(
-                "huffman-glitch:swaps=128,intensity=0.5,target=luma-ac,engine=table,mode=symbol-remap,preserve_size=false"
+                "huffman-glitch:swaps=128,intensity=0.5,target=luma-ac,engine=coefficient,mode=symbol-remap,preserve_size=false,scan_start=2,scan_count=1,frequency_start=4,frequency_end=20"
             )
             .unwrap(),
             FilterSpec::HuffmanGlitch {
                 swaps: 128,
                 intensity: 0.5,
                 target: HuffmanTarget::LumaAc,
-                engine: HuffmanGlitchEngine::Table,
+                engine: HuffmanGlitchEngine::Coefficient,
                 mode: HuffmanGlitchMode::SymbolRemap,
                 preserve_size: false,
+                scan_start: 2,
+                scan_count: 1,
+                frequency_start: 4,
+                frequency_end: 20,
             }
         );
         assert_eq!(
@@ -924,6 +962,10 @@ mod tests {
                 engine: HuffmanGlitchEngine::Table,
                 mode: HuffmanGlitchMode::RunRemap,
                 preserve_size: true,
+                scan_start: 0,
+                scan_count: 0,
+                frequency_start: 1,
+                frequency_end: 63,
             }
         );
         assert_eq!(
@@ -989,7 +1031,7 @@ mod tests {
         assert!(FilterSpec::parse("mp3-main-data-noise:intensity=1.1").is_err());
         assert!(FilterSpec::parse("ogg-packet-noise:byte_budget=0").is_err());
         assert!(FilterSpec::parse("ogg-packet-noise:intensity=1.1").is_err());
-        assert!(FilterSpec::parse("huffman-glitch:engine=coefficient").is_err());
+        assert!(FilterSpec::parse("huffman-glitch:engine=spatial").is_err());
     }
 
     #[test]
