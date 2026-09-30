@@ -27,6 +27,26 @@ cargo build
 cargo test
 ```
 
+`cargo build` produces the debug executable at `target/debug/databender`. For day-to-day use, build an optimized binary once and run it directly:
+
+```bash
+cargo build --release
+./target/release/databender --help
+```
+
+The examples below invoke the debug build as `./target/debug/databender`; substitute `target/release/databender` when using a release build.
+
+## Primary interface: the TUI
+
+The terminal user interface is the primary way to use Databender. It combines media browsing, preview, pipeline construction, plugin management, and a pausable processing queue in one full-screen application:
+
+```bash
+cargo build
+./target/debug/databender tui media --output-dir bent
+```
+
+The CLI subcommands documented below (`transform`, `batch`, `plan`, and the discovery commands) expose the same functionality for scripting and automation; everything they do is also available interactively in the TUI. See [the TUI reference](#terminal-interface-tui) for the complete controls.
+
 MP3, Ogg, MP4, and Matroska validation and compressed processing use installed `ffmpeg` and `ffprobe`. The library provides a timeout-aware runner that invokes them without a shell, nulls standard input, and bounds captured output. MP3 additionally supports native structure-aware main-data mutation. Typed high-pass, low-pass, echo, and volume filters compile into an allowlisted audio graph; hue, equalization, and lag compile into an allowlisted video graph. Outputs are fully decoded before publication. MP4 and Matroska map one primary video stream and every audio stream, apply native image filters frame-by-frame and PCM noise to 16-bit WAV intermediates, and validate stream geometry and basic metadata.
 
 Executables are discovered through `PATH` by default. Set `DATABENDER_FFMPEG` and `DATABENDER_FFPROBE` to explicit executable paths when they are installed elsewhere. Pipeline preflight reports missing tools, required encoders, and typed FFmpeg filters before media processing begins.
@@ -34,8 +54,8 @@ Executables are discovered through `PATH` by default. Set `DATABENDER_FFMPEG` an
 Inspect the available formats and filter names:
 
 ```bash
-cargo run -- list-formats
-cargo run -- list-filters
+./target/debug/databender list-formats
+./target/debug/databender list-filters
 ```
 
 `list-filters` groups filters by compatible codec and processing domain.
@@ -44,7 +64,7 @@ Discovery checks `ffmpeg`, `ffprobe`, and the required encoders. FFmpeg-backed f
 Discover import-free WebAssembly plugin bundles from explicit directories:
 
 ```bash
-cargo run -- list-plugins --plugin-dir plugins \
+./target/debug/databender list-plugins --plugin-dir plugins \
 	--disable-plugin example.experimental
 ```
 
@@ -53,7 +73,7 @@ Each bundle pairs `<name>.plugin.json` with `<name>.wasm`. Discovery reports ena
 Validate an ordered pipeline without reading or writing media:
 
 ```bash
-cargo run -- plan \
+./target/debug/databender plan \
 	--format png \
 	--seed 42 \
 	--filter channel-shift \
@@ -63,7 +83,7 @@ cargo run -- plan \
 Transform an image with ordered pixel filters:
 
 ```bash
-cargo run -- transform input.png \
+./target/debug/databender transform input.png \
 	--output output.png \
 	--seed 42 \
 	--filter channel-shift:pixels=8 \
@@ -74,7 +94,7 @@ cargo run -- transform input.png \
 PNG pipelines can mix pixel and payload filters in order:
 
 ```bash
-cargo run -- transform input.png \
+./target/debug/databender transform input.png \
 	--output output.png \
 	--seed 42 \
 	--filter byte-noise:probability=0.08 \
@@ -85,7 +105,7 @@ cargo run -- transform input.png \
 For severe JPEG corruption, mutate the AC Huffman symbol tables. Baseline JPEGs are analyzed in real time so frequently used symbols can drive the remapping. Higher swap counts and intensity generally produce more block displacement and coefficient collapse:
 
 ```bash
-cargo run -- transform input.jpg \
+./target/debug/databender transform input.jpg \
 	--output output.jpg \
 	--seed 42 \
 	--filter huffman-glitch:swaps=128,intensity=0.75,target=luma-ac,engine=table,mode=run-remap
@@ -96,7 +116,7 @@ cargo run -- transform input.jpg \
 WAV pipelines can mix sample-aware bounded noise and length-preserving payload filters. RIFF chunks outside `data` remain byte-identical:
 
 ```bash
-cargo run -- transform input.wav \
+./target/debug/databender transform input.wav \
 	--output output.wav \
 	--seed 42 \
 	--filter byte-swap:count=128 \
@@ -106,7 +126,7 @@ cargo run -- transform input.wav \
 MP3 pipelines can alternate bounded native main-data mutation and typed FFmpeg effects while preserving basic container metadata:
 
 ```bash
-cargo run -- transform input.mp3 \
+./target/debug/databender transform input.mp3 \
 	--output output.mp3 \
 	--seed 42 \
 	--filter mp3-main-data-noise:byte_budget=8,start_frame=2,frame_count=20,intensity=0.125 \
@@ -122,7 +142,7 @@ The Layer III parser protects frame headers, optional CRC fields, side informati
 Ogg pipelines support bounded packet payload mutation before or after decoded audio effects:
 
 ```bash
-cargo run -- transform input.ogg \
+./target/debug/databender transform input.ogg \
 	--output output.ogg \
 	--seed 42 \
 	--filter ogg-packet-noise:byte_budget=8,start_packet=2,packet_count=16,intensity=0.125,max_decode_errors=0 \
@@ -134,7 +154,7 @@ Vorbis and Opus identification and setup packets are protected. Audio packets ma
 Explicit expert graphs can use additional installed FFmpeg filters without changing the typed defaults:
 
 ```bash
-cargo run -- transform input.mp3 --output output.mp3 --seed 42 \
+./target/debug/databender transform input.mp3 --output output.mp3 --seed 42 \
 	--filter 'expert-audio-graph:volume=0.5,aecho=0.8:0.9:20:0.2'
 ```
 
@@ -143,7 +163,7 @@ Use `expert-video-graph:<fragment>` for video. Expert fragments are bounded sing
 MP4 pipelines can interleave typed video and audio effects. Effects retain their order within each target stream:
 
 ```bash
-cargo run -- transform input.mp4 \
+./target/debug/databender transform input.mp4 \
 	--output output.mp4 \
 	--seed 42 \
 	--video-stream 0 \
@@ -160,7 +180,7 @@ Native and FFmpeg stages use lossless FFV1 or PCM intermediates so their relativ
 MP4 and Matroska also support packet-only H.264, H.265, VP8, VP9, and AV1 payload mutation. MP4 verifies direct packet offsets by SHA-256; Matroska resolves unlaced EBML block payloads by size and SHA-256. Both preserve container bookkeeping through equal-length writes and reject mixed packet/decoded pipelines.
 
 ```bash
-cargo run -- transform input.mp4 \
+./target/debug/databender transform input.mp4 \
 	--output output.mp4 \
 	--seed 42 \
 	--filter video-packet-noise:byte_budget=8,start_packet=2,packet_count=16,frame_type=delta,intensity=0.125,max_frame_loss=0
@@ -189,18 +209,18 @@ disabled = ["example.noisy"]
 `plan_version` is required when a preset uses encoded mutation or an expert FFmpeg graph. It must match the version printed by `plan`; this prevents a preset from silently adopting changed codec or graph semantics.
 
 ```bash
-cargo run -- transform input.png --output output.png \
+./target/debug/databender transform input.png --output output.png \
 	--config databender.toml --preset shift
 ```
 
 Batch mode recursively expands explicit files or directories and automatically excludes files whose extension is not supported. Extension matching is case-insensitive; included files are still validated by content signature. Flat layout uses source file names and rejects collisions before processing; mirrored layout retains paths relative to `--root`. `--jobs` bounds concurrent files, while output reports remain in deterministic input order:
 
 ```bash
-cargo run -- batch media --output-dir bent \
+./target/debug/databender batch media --output-dir bent \
 	--layout mirrored --root media --jobs 4 --seed 42 \
 	--video-stream 0 --filter invert
 
-cargo run -- batch media --output-dir bent \
+./target/debug/databender batch media --output-dir bent \
 	--seed 42 --filter invert --dry-run --json
 ```
 
@@ -210,14 +230,16 @@ Use `--manifest state.json` to atomically save a versioned report. A later run w
 
 Omit `--seed` to generate and print one. Existing destinations are replaced by default; use `--protect-output` to refuse replacement. The input file is never overwritten.
 
-Additional JPEG/PNG pixel filters are `brightness`, `contrast`, `saturation`, `hue-rotate`, `posterize`, `invert`, and seeded `row-dropout`. `huffman-glitch` is JPEG-only and defaults to 32 swaps, full intensity, luma AC, run remapping, and preserved amplitude size. Run `cargo run -- list-filters` for codec compatibility. Byte filters such as `byte-swap` operate on PNG scanline payloads and are rejected for JPEG.
+Additional JPEG/PNG pixel filters are `brightness`, `contrast`, `saturation`, `hue-rotate`, `posterize`, `invert`, and seeded `row-dropout`. `huffman-glitch` is JPEG-only and defaults to 32 swaps, full intensity, luma AC, run remapping, and preserved amplitude size. Run `./target/debug/databender list-filters` for codec compatibility. Byte filters such as `byte-swap` operate on PNG scanline payloads and are rejected for JPEG.
 
 Pixel transforms preserve supported basic metadata: JPEG APP1/EXIF, APP2/ICC, and comments; PNG color/profile, resolution, EXIF, text, and timestamp chunks; and WebP ICC, EXIF, and XMP chunks. Pixel-layout-dependent PNG chunks are intentionally not transplanted. Animated WebP is processed frame-by-frame with deterministic frame seeds while preserving frame order, millisecond durations, loop count, alpha, and supported WebP metadata. AVIF sequences preserve frame order, rational frame durations, finite or infinite loop count, and auxiliary alpha tracks. AVIF metadata preservation is not yet implemented. Alpha sequence output uses `avifenc`, configurable with `DATABENDER_AVIFENC`; opaque sequences continue to use FFmpeg.
 
-Browse media and choose an output directory in the terminal interface:
+## Terminal interface (TUI)
+
+The TUI is the primary user interface for Databender. Browse media and choose an output directory in the terminal interface:
 
 ```bash
-cargo run -- tui media --output-dir bent
+./target/debug/databender tui media --output-dir bent
 ```
 
 The input browser recursively excludes files without a supported extension before probing their content. The bottom-row hint keeps the primary controls visible. Press `?` for the complete in-TUI controls guide; `?`, Escape, or `q` closes the guide without triggering the hidden action. Press `f` to list supported formats and filters or `v` to expand the selected media preview; `v`, Escape, or `q` closes the expanded view. Use Up/Down or `k`/`j` to select media, Home/End to jump, `p` to enter a typed filter specification, Left/Right to select a pipeline entry, `e` to edit the highlighted entry in place, `d` to remove it, and `o` to edit the output directory. Resolved default options are omitted from pipeline rows; options explicitly entered in the TUI, CLI, or a preset remain visible when edited. Use `[` and `]` to select a discovered plugin and `t` to toggle its enabled state. Enter accepts an edit, Escape cancels it, and `q` exits when overlays are closed. Pipeline edits are preflighted against the selected codec immediately. Initialize the editor with `--config` and `--preset`, or repeated `--filter` options. Choose `--theme standard`, `--theme high-contrast`, or `--theme monochrome`; `--no-color` and the `NO_COLOR` environment variable force monochrome output.
